@@ -1,0 +1,102 @@
+name: Buffer draft test
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel_ids:
+        description: "One or two Buffer channel IDs, separated by a comma. Leave blank to list channels."
+        type: string
+      image_url:
+        description: "Public HTTPS URL of the test graphic"
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: buffer-draft-test
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+      CHANNEL_IDS: ${{ inputs.channel_ids }}
+      IMAGE_URL: ${{ inputs.image_url }}
+    steps:
+      - name: Check Buffer channels or create test drafts
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.error import HTTPError
+          from urllib.parse import urlsplit
+          from urllib.request import Request, urlopen
+
+          key = os.environ["BUFFER_API_KEY"]
+          if not key:
+              raise SystemExit("Add BUFFER_API_KEY as a repository Actions secret.")
+
+          def graphql(query, variables=None):
+              request = Request(
+                  "https://api.buffer.com",
+                  data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+                  headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      result = json.load(response)
+              except HTTPError as error:
+                  raise SystemExit(f"Buffer returned HTTP {error.code}.") from None
+              if result.get("errors"):
+                  raise SystemExit("Buffer GraphQL error: " + json.dumps(result["errors"]))
+              return result["data"]
+
+          organisations = graphql("{ account { organizations { id name } } }")["account"]["organizations"]
+          channels = {}
+          for organisation in organisations:
+              query = '{ channels(input: { organizationId: %s }) { id displayName service } }'
+              for channel in graphql(query % json.dumps(organisation["id"]))["channels"]:
+                  if channel["service"] in {"facebook", "instagram"}:
+                      channels[channel["id"]] = channel
+                      print(f'{organisation["name"]}: {channel["service"]} | {channel["displayName"]} | {channel["id"]}')
+
+          selected = list(dict.fromkeys(part.strip() for part in os.environ["CHANNEL_IDS"].split(",") if part.strip()))
+          if not selected:
+              if not channels:
+                  raise SystemExit("Buffer returned no Facebook or Instagram channels.")
+              raise SystemExit(0)
+
+          if any(channel_id not in channels for channel_id in selected):
+              raise SystemExit("Choose IDs from the Facebook and Instagram channels listed above.")
+          if len({channels[channel_id]["service"] for channel_id in selected}) != len(selected):
+              raise SystemExit("Choose at most one channel per platform.")
+
+          image_url = os.environ["IMAGE_URL"].strip()
+          parsed = urlsplit(image_url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              raise SystemExit("Enter a public HTTPS image URL.")
+
+          mutation = """
+          mutation CreateDraft($input: CreatePostInput!) {
+              createPost(input: $input) {
+                  ... on PostActionSuccess { post { id } }
+                  ... on MutationError { message }
+              }
+          }
+          """
+          for channel_id in selected:
+              payload = {
+                  "channelId": channel_id,
+                  "text": "A closer look at coin collecting. Start with one theme you enjoy, such as a design, a date or a monarch, and let your collection grow from there. | VC Bullion",
+                  "assets": [{"image": {"url": image_url}}],
+                  "schedulingType": "automatic",
+                  "mode": "addToQueue",
+                  "saveToDraft": True,
+              }
+              result = graphql(mutation, {"input": payload})["createPost"]
+              if not result.get("post"):
+                  raise SystemExit(f'Buffer could not save the draft for {channel_id}: {result.get("message")}')
+              print(f'Saved Buffer draft {result["post"]["id"]} for {channels[channel_id]["displayName"]}.')
+          PY
