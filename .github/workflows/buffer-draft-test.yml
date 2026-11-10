@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       channel_ids:
-        description: "One or two Buffer channel IDs, separated by a comma. Leave blank to list channels."
+        description: "Up to three Buffer channel IDs, separated by a comma. Leave blank to list channels."
         type: string
       image_url:
         description: "Public HTTPS URL of the test graphic"
@@ -58,18 +58,18 @@ jobs:
           for organisation in organisations:
               query = '{ channels(input: { organizationId: %s }) { id displayName service } }'
               for channel in graphql(query % json.dumps(organisation["id"]))["channels"]:
-                  if channel["service"] in {"facebook", "instagram"}:
+                  if channel["service"] in {"facebook", "instagram", "twitter"}:
                       channels[channel["id"]] = channel
                       print(f'{organisation["name"]}: {channel["service"]} | {channel["displayName"]} | {channel["id"]}')
 
           selected = list(dict.fromkeys(part.strip() for part in os.environ["CHANNEL_IDS"].split(",") if part.strip()))
           if not selected:
               if not channels:
-                  raise SystemExit("Buffer returned no Facebook or Instagram channels.")
+                  raise SystemExit("Buffer returned no Facebook, Instagram or X channels.")
               raise SystemExit(0)
 
           if any(channel_id not in channels for channel_id in selected):
-              raise SystemExit("Choose IDs from the Facebook and Instagram channels listed above.")
+              raise SystemExit("Choose IDs from the Facebook, Instagram or X channels listed above.")
           if len({channels[channel_id]["service"] for channel_id in selected}) != len(selected):
               raise SystemExit("Choose at most one channel per platform.")
 
