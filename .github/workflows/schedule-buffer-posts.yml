@@ -1,0 +1,106 @@
+name: Schedule social posts in Buffer
+
+on:
+  push:
+    branches: [main]
+    paths: ['posts/*.json']
+
+permissions:
+  contents: read
+
+jobs:
+  schedule:
+    if: github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+      BEFORE: ${{ github.event.before }}
+    steps:
+      - name: Schedule new dated posts at 10 am UK time
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+          from datetime import date, datetime, time
+          from urllib.parse import urlsplit
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          head = os.environ["GITHUB_SHA"]
+          before = os.environ["BEFORE"]
+          london = ZoneInfo("Europe/London")
+          channels = {
+              "facebook": "6af3440762b70b94b0e4a265",
+              "instagram": "6af3443a62b70b94b0e4a511",
+              "x": "6af356dd62b70b94b0e5b890",
+          }
+
+          def github(path):
+              return json.loads(subprocess.check_output(["gh", "api", f"repos/{repo}/{path}"]))
+
+          files = github(f"compare/{before}...{head}")["files"]
+          posts = []
+          for entry in files:
+              path = entry["filename"]
+              match = re.fullmatch(r"posts/(\d{4}-\d{2}-\d{2})\.json", path)
+              if entry["status"] != "added" or not match:
+                  continue
+              due = datetime.combine(date.fromisoformat(match[1]), time(10), london)
+              if due <= datetime.now(london):
+                  raise SystemExit(f"Choose a future publication date for {path}.")
+              raw = github(f"contents/{path}?ref={head}")["content"]
+              post = json.loads(base64.b64decode(raw))
+              image = urlsplit(post["image_url"])
+              if image.scheme != "https" or not image.hostname or image.username or image.password:
+                  raise SystemExit(f"Provide a public HTTPS image URL in {path}.")
+              for platform in channels:
+                  if not post["captions"][platform].strip().endswith("https://vcbullion.com/"):
+                      raise SystemExit(f"The {platform} caption in {path} must end with the website URL.")
+              posts.append((post, due))
+
+          key = os.environ["BUFFER_API_KEY"]
+          if not key:
+              raise SystemExit("BUFFER_API_KEY is required.")
+          mutation = """
+          mutation SchedulePost($input: CreatePostInput!) {
+              createPost(input: $input) {
+                  ... on PostActionSuccess { post { id } }
+                  ... on MutationError { message }
+              }
+          }
+          """
+          failures = []
+          for post, due in posts:
+              for platform, channel_id in channels.items():
+                  payload = {
+                      "channelId": channel_id,
+                      "text": post["captions"][platform],
+                      "assets": [{"image": {"url": post["image_url"]}}],
+                      "schedulingType": "automatic",
+                      "mode": "customScheduled",
+                      "dueAt": due.isoformat(),
+                  }
+                  request = Request(
+                      "https://api.buffer.com",
+                      data=json.dumps({"query": mutation, "variables": {"input": payload}}).encode(),
+                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                  )
+                  try:
+                      with urlopen(request, timeout=30) as response:
+                          result = json.load(response)
+                      post_id = result["data"]["createPost"]["post"]["id"]
+                  except (OSError, ValueError, KeyError, TypeError) as error:
+                      print(f"Could not verify {platform} for {due.date()}: {error}")
+                      failures.append(platform)
+                  else:
+                      print(f"Scheduled {platform} for {due.isoformat()}. Buffer post ID: {post_id}")
+          if failures:
+              raise SystemExit("Check the Buffer queues before retrying. Some posts may already be scheduled.")
+          PY
