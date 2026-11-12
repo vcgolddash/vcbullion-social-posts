@@ -1,0 +1,152 @@
+name: Retry 12 November Facebook and Instagram post
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/retry-meta-2026-11-12.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency: retry-meta-2026-11-12
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+    steps:
+      - name: Check for duplicates and publish to Meta
+        shell: bash
+        run: |
+          python3 -u - <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          import time
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+          def buffer(query, variables=None):
+              request = Request(
+                  "https://api.buffer.com",
+                  data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+                  headers={"Content-Type": "application/json",
+                           "Authorization": "Bearer " + os.environ["BUFFER_API_KEY"]},
+              )
+              try:
+                  with urlopen(request, timeout=20) as response:
+                      result = json.load(response)
+              except HTTPError as error:
+                  raise RuntimeError(f"Buffer HTTP {error.code}") from error
+              if result.get("errors"):
+                  raise RuntimeError("; ".join(error["message"] for error in result["errors"]))
+              return result["data"]
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          source = json.loads(subprocess.check_output([
+              "gh", "api", f"repos/{repo}/contents/posts/2026-11-12.json"
+          ]))
+          post = json.loads(base64.b64decode(source["content"]))
+          targets = {
+              "facebook": "6af3440762b70b94b0e4a265",
+              "instagram": "6af3443a62b70b94b0e4a511",
+          }
+          organizations = buffer("{ account { organizations { id } } }")["account"]["organizations"]
+          owner = {}
+          for organization in organizations:
+              organization_id = organization["id"]
+              channels = buffer(
+                  "query($id: OrganizationId!) { channels(input: {organizationId: $id}) { id service } }",
+                  {"id": organization_id},
+              )["channels"]
+              for channel in channels:
+                  if targets.get(channel["service"]) == channel["id"]:
+                      owner[channel["service"]] = organization_id
+
+          def matches(platform, caption):
+              org = json.dumps(owner[platform])
+              channel = json.dumps(targets[platform])
+              query = f"""
+                  query($after: String) {{
+                      posts(first: 50, after: $after, input: {{
+                          organizationId: {org}
+                          filter: {{channelIds: [{channel}], startDate: "2026-11-11T00:00:00Z",
+                                    status: [draft, error, needs_approval, scheduled, sending, sent]}}
+                      }}) {{
+                          edges {{ node {{ id text status }} }}
+                          pageInfo {{ hasNextPage endCursor }}
+                      }}
+                  }}
+              """
+              cursor = None
+              while True:
+                  page = buffer(query, {"after": cursor})["posts"]
+                  for edge in page["edges"]:
+                      node = edge["node"]
+                      if " ".join((node["text"] or "").split()) == " ".join(caption.split()):
+                          yield node
+                  if not page["pageInfo"]["hasNextPage"]:
+                      return
+                  cursor = page["pageInfo"]["endCursor"]
+
+          mutation = """
+              mutation($input: CreatePostInput!) {
+                  createPost(input: $input) {
+                      ... on PostActionSuccess { post { id status } }
+                      ... on MutationError { message }
+                  }
+              }
+          """
+          pending = {}
+          failures = []
+          for platform, channel_id in targets.items():
+              caption = post["captions"][platform]
+              try:
+                  if platform not in owner:
+                      raise RuntimeError("Original channel ID was not found in Buffer")
+                  existing = [item for item in matches(platform, caption) if item["status"] != "error"]
+                  if existing:
+                      print(f"{platform}: matching posts " +
+                            ", ".join(f"{item['id']} ({item['status']})" for item in existing))
+                      if any(item["status"] == "sent" for item in existing):
+                          continue
+                      if all(item["status"] in {"draft", "needs_approval"} for item in existing):
+                          raise RuntimeError("A matching draft or approval request already exists")
+                      pending[platform] = caption
+                      continue
+                  result = buffer(mutation, {"input": {
+                      "channelId": channel_id, "text": caption, "mode": "shareNow",
+                      "schedulingType": "automatic", "needsApproval": False,
+                      "assets": [{"image": {"url": post["image_url"]}}],
+                      "metadata": {platform: {"type": "post"}},
+                  }})["createPost"]
+                  created = result.get("post")
+                  if not created:
+                      raise RuntimeError(result.get("message", "Buffer did not return a post"))
+                  print(f"{platform}: accepted {created['id']} ({created['status']})")
+                  if created["status"] != "sent":
+                      pending[platform] = caption
+              except Exception as error:
+                  print(f"{platform}: {error}")
+                  failures.append(platform)
+
+          for attempt in range(8):
+              if not pending:
+                  break
+              time.sleep(8)
+              for platform, caption in list(pending.items()):
+                  try:
+                      existing = list(matches(platform, caption))
+                      if any(item["status"] == "sent" for item in existing):
+                          print(f"{platform}: Buffer confirms publication (sent)")
+                          del pending[platform]
+                  except Exception as error:
+                      print(f"{platform}: publication check: {error}")
+          if failures or pending:
+              raise SystemExit("Publication not confirmed for: " + ", ".join(failures + list(pending)))
+          PY
