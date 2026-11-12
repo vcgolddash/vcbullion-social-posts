@@ -76,6 +76,10 @@ jobs:
               }
           }
           """
+          metadata = {
+              "facebook": {"type": "post"},
+              "instagram": {"type": "post", "shouldShareToFeed": True},
+          }
           failures = []
           for post, due in posts:
               for platform, channel_id in channels.items():
@@ -87,6 +91,8 @@ jobs:
                       "mode": "customScheduled",
                       "dueAt": due.isoformat(),
                   }
+                  if platform in metadata:
+                      payload["metadata"] = {platform: metadata[platform]}
                   request = Request(
                       "https://api.buffer.com",
                       data=json.dumps({"query": mutation, "variables": {"input": payload}}).encode(),
@@ -95,7 +101,12 @@ jobs:
                   try:
                       with urlopen(request, timeout=30) as response:
                           result = json.load(response)
-                      post_id = result["data"]["createPost"]["post"]["id"]
+                      if result.get("errors"):
+                          raise ValueError("; ".join(error["message"] for error in result["errors"]))
+                      created = result["data"]["createPost"]
+                      if not created.get("post"):
+                          raise ValueError(created.get("message", "Buffer did not return a post"))
+                      post_id = created["post"]["id"]
                   except (OSError, ValueError, KeyError, TypeError) as error:
                       print(f"Could not verify {platform} for {due.date()}: {error}")
                       failures.append(platform)
