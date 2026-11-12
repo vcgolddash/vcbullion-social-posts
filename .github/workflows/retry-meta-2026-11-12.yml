@@ -53,7 +53,6 @@ jobs:
           ]))
           post = json.loads(base64.b64decode(source["content"]))
           targets = {
-              "facebook": "6af3440762b70b94b0e4a265",
               "instagram": "6af3443a62b70b94b0e4a511",
           }
           organizations = buffer("{ account { organizations { id } } }")["account"]["organizations"]
@@ -123,7 +122,7 @@ jobs:
                       "channelId": channel_id, "text": caption, "mode": "shareNow",
                       "schedulingType": "automatic", "needsApproval": False,
                       "assets": [{"image": {"url": post["image_url"]}}],
-                      "metadata": {platform: {"type": "post"}},
+                      "metadata": {platform: {"type": "post", "shouldShareToFeed": True}},
                   }})["createPost"]
                   created = result.get("post")
                   if not created:
